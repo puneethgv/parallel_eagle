@@ -23,13 +23,15 @@ def propose_tree(
     k: int,
     top_k: int,
     max_nodes: int,
+    pending: int = 0,
 ) -> tuple[list[int], list[int]]:
     """Return ``(node_tokens, parents)`` in topological order (parent before child).
 
-    ``parents[t] == -1`` means the node hangs off the confirmed prefix.
+    ``parents[t] == -1`` means the node hangs off the confirmed prefix. ``pending``
+    leading depths (already-confirmed tokens) are skipped before building the tree.
     """
-    logits = drafter.draft_logits(context_ids, context_feats, k)  # (k, V)
-    logprobs = torch.log_softmax(logits.float(), dim=-1)
+    logits = drafter.draft_logits(context_ids, context_feats, k + pending)
+    logprobs = torch.log_softmax(logits.float(), dim=-1)[pending:]  # (k, V)
 
     beam_width = max(1, min(top_k, max_nodes // max(1, k)))
     beam: list[tuple[int, float]] = [(-1, 0.0)]  # (parent node index, cumulative logprob)

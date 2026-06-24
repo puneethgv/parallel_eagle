@@ -25,9 +25,10 @@ def _example_to_ids(example: dict, tokenizer, max_len: int) -> torch.Tensor | No
     """Best-effort conversion of a dataset row to a single token sequence."""
     ids = None
     if "messages" in example and getattr(tokenizer, "chat_template", None):
-        ids = tokenizer.apply_chat_template(
+        res = tokenizer.apply_chat_template(
             example["messages"], tokenize=True, add_generation_prompt=False
         )
+        ids = res["input_ids"] if hasattr(res, "keys") else res
     elif "text" in example:
         ids = tokenizer(example["text"]).input_ids
     elif "prompt" in example:

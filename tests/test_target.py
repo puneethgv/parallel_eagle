@@ -2,8 +2,6 @@
 
 import torch
 
-from pe.target import TargetModel
-
 
 def test_feature_dim_and_forward(tiny_target):
     t = tiny_target

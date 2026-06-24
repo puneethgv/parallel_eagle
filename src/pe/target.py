@@ -40,9 +40,7 @@ class TargetModel:
         self.cfg = cfg
         self.dtype = _DTYPES[cfg.dtype]
         if model is None:
-            model = AutoModelForCausalLM.from_pretrained(
-                cfg.model_name, torch_dtype=self.dtype
-            )
+            model = AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=self.dtype)
         self.model = model.to(cfg.device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -107,6 +105,10 @@ class TargetModel:
     def _fuse(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return torch.cat([hidden_states[i] for i in self.feature_layers], dim=-1)
 
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
     @torch.no_grad()
     def forward(
         self,
@@ -128,3 +130,59 @@ class TargetModel:
             use_cache=False,
         )
         return TargetOutput(logits=out.logits, fused=self._fuse(out.hidden_states))
+
+
+@dataclass
+class TargetHeads:
+    """Just the frozen embedding + LM head (and dims) the drafter needs.
+
+    Used at train time so the full target never has to occupy the GPU: only the
+    two large matrices the drafter shares are kept resident.
+    """
+
+    config: object
+    hidden_size: int
+    vocab_size: int
+    feature_dim: int
+    num_feature_layers: int
+    feature_layers: tuple[int, ...]
+    embed: torch.nn.Module
+    head: torch.nn.Module
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def get_lm_head(self):
+        return self.head
+
+
+def load_target_heads(cfg: TargetConfig) -> TargetHeads:
+    """Load only the embedding and LM head onto the device; free the rest."""
+    import gc
+
+    dtype = _DTYPES[cfg.dtype]
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=dtype)
+    config = model.config
+    feature_layers = TargetModel._resolve_feature_layers(
+        cfg.feature_layers, config.num_hidden_layers
+    )
+    embed = model.get_input_embeddings().to(cfg.device)
+    head = model.get_output_embeddings().to(cfg.device)
+    for m in (embed, head):
+        for p in m.parameters():
+            p.requires_grad_(False)
+    heads = TargetHeads(
+        config=config,
+        hidden_size=config.hidden_size,
+        vocab_size=config.vocab_size,
+        feature_dim=config.hidden_size * len(feature_layers),
+        num_feature_layers=len(feature_layers),
+        feature_layers=feature_layers,
+        embed=embed,
+        head=head,
+    )
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return heads

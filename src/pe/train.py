@@ -119,7 +119,7 @@ def _parse():
 
 if __name__ == "__main__":
     a = _parse()
-    tcfg = TargetConfig(model_name=a.target, device=a.device)
+    tcfg = TargetConfig(model_name=a.target, device=a.device, dtype=a.dtype)
     dcfg = DrafterConfig(num_layers=a.num_layers, max_depth=a.max_depth)
     tr = TrainConfig(
         feature_cache_dir=Path(a.cache_dir),

@@ -1,16 +1,19 @@
 """Speculative generation loop wiring the drafter and the frozen target.
 
-One iteration:
-  1. run the target over the current sequence to refresh fused features
-     (and the immediate next-token distribution);
-  2. propose candidates with the drafter — a chain (top-1 per depth), the same
-     chain produced by sequential passes, or a dynamic tree;
-  3. run the target once over ``[sequence | candidates]`` and accept the longest
-     target-consistent prefix/path, plus one bonus token.
+After an initial prefill, each iteration is a **single** target forward:
+  1. the drafter proposes candidates from the last token whose target feature is
+     known — a chain (top-1 per depth), the same chain via sequential passes, or a
+     dynamic tree;
+  2. the target scores ``[sequence | candidates]`` in one pass; the longest
+     target-consistent prefix/path is accepted, plus one bonus token.
 
-The two target passes per iteration keep the loop simple and obviously lossless
-without KV-cache bookkeeping; the reported acceptance length and target-calls-
-per-token are independent of that implementation choice.
+The verification pass also yields the target's hidden states for the accepted
+positions, which are carried forward as the next step's drafter features — so no
+extra target pass is needed. The freshly produced bonus token has no feature yet;
+it is re-fed (as part of the prefix) on the next iteration, which is why the
+drafter is asked for ``pending + k`` depths and the first ``pending`` are skipped.
+
+Greedy acceptance makes the output identical to plain decoding (lossless).
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import time
 
 import torch
 
-from .decode.baselines import vanilla_generate  # re-exported for convenience
+from .decode.baselines import vanilla_generate  # noqa: F401 (re-export)
 from .decode.chain import propose_chain, propose_chain_sequential
 from .decode.result import GenResult
 from .decode.tree import propose_tree
@@ -43,7 +46,7 @@ def generate_speculative(
     mode: str = "tree",
     max_new_tokens: int = 256,
     tree_top_k: int = 3,
-    tree_max_nodes: int = 48,
+    tree_max_nodes: int = 24,
     eos_token_id: int | None = None,
 ) -> GenResult:
     if mode not in _CHAIN_MODES and mode != "tree":
@@ -51,28 +54,35 @@ def generate_speculative(
     dev = target.device
     seq = list(prompt_ids)
     base = len(seq)
-    steps = target_calls = drafter_calls = accepted = 0
+
+    # prefill: features for every prompt token
+    feats = target.forward(torch.tensor(seq, device=dev).unsqueeze(0)).fused[0]
+    featured_len = len(seq)
+    target_calls, drafter_calls, accepted, steps = 1, 0, 0, 0
     stop = False
     t0 = time.perf_counter()
 
     while len(seq) - base < max_new_tokens and not stop:
+        g = len(seq) - featured_len  # confirmed-but-unfeatured tail (bonus); 0 on first step
         prefix_len = len(seq)
-        feats = target.forward(torch.tensor(seq, device=dev).unsqueeze(0)).fused[0]
-        target_calls += 1
-        ctx = torch.tensor(seq, device=dev)
+        ctx = torch.tensor(seq[:featured_len], device=dev)
 
         if mode in _CHAIN_MODES:
             if mode == "chain":
-                drafts = propose_chain(drafter, ctx, feats, k)
+                fresh = propose_chain(drafter, ctx, feats, k, pending=g)
                 drafter_calls += 1
             else:
-                drafts = propose_chain_sequential(drafter, ctx, feats, k)
-                drafter_calls += k
-            vout = target.forward(torch.tensor(seq + drafts, device=dev).unsqueeze(0))
+                fresh = propose_chain_sequential(drafter, ctx, feats, k, pending=g)
+                drafter_calls += k + g
+            vout = target.forward(torch.tensor(seq + fresh, device=dev).unsqueeze(0))
             target_calls += 1
-            acc, bonus = accept_chain_greedy(vout.logits[0], prefix_len, drafts)
+            committed, bonus = accept_chain_greedy(vout.logits[0], prefix_len, fresh)
+            num_acc = len(committed)
+            feats = vout.fused[0][: prefix_len + num_acc]
         else:
-            node_tokens, parents = propose_tree(drafter, ctx, feats, k, tree_top_k, tree_max_nodes)
+            node_tokens, parents = propose_tree(
+                drafter, ctx, feats, k, tree_top_k, tree_max_nodes, pending=g
+            )
             drafter_calls += 1
             bias = to_additive_bias(tree_allow_mask(parents, prefix_len, device=dev), target.dtype)
             pos = tree_position_ids(parents, prefix_len, device=dev).unsqueeze(0)
@@ -82,17 +92,19 @@ def generate_speculative(
                 position_ids=pos,
             )
             target_calls += 1
-            acc, bonus = accept_tree_greedy(vout.logits[0], prefix_len, node_tokens, parents)
+            path, bonus = accept_tree_greedy(vout.logits[0], prefix_len, node_tokens, parents)
+            committed = [node_tokens[t] for t in path]
+            num_acc = len(committed)
+            idx = list(range(prefix_len)) + [prefix_len + t for t in path]
+            feats = vout.fused[0][idx]
 
-        accepted += len(acc)
+        accepted += num_acc
         steps += 1
-        for tok in [*acc, bonus]:
-            seq.append(tok)
-            if eos_token_id is not None and tok == eos_token_id:
-                stop = True
-                break
-            if len(seq) - base >= max_new_tokens:
-                break
+        seq.extend(committed)
+        seq.append(bonus)
+        featured_len = prefix_len + num_acc
+        if eos_token_id is not None and (bonus == eos_token_id or eos_token_id in committed):
+            stop = True
 
     if dev.type == "cuda":
         torch.cuda.synchronize()

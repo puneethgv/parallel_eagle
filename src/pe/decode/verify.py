@@ -17,7 +17,10 @@ import torch
 def accept_chain_greedy(
     logits: torch.Tensor, prefix_len: int, draft_tokens: list[int]
 ) -> tuple[list[int], int]:
-    """``logits`` covers ``[prefix | draft_tokens]`` (shape ``(P + K, V)``)."""
+    """``logits`` covers ``[prefix | draft_tokens]`` (shape ``(P + K, V)``).
+
+    Returns the accepted draft tokens and the bonus token (target's correction).
+    """
     p, k = prefix_len, len(draft_tokens)
     truths = logits[p - 1 : p - 1 + k].argmax(-1)
     a = 0
@@ -32,8 +35,12 @@ def accept_chain_greedy(
 def accept_tree_greedy(
     logits: torch.Tensor, prefix_len: int, node_tokens: list[int], parents: list[int]
 ) -> tuple[list[int], int]:
-    """``logits`` covers ``[prefix | tree nodes]``; follow the target's argmax down
-    the tree as far as a matching child exists."""
+    """``logits`` covers ``[prefix | tree nodes]``. Follow the target's argmax down
+    the tree as far as a matching child exists.
+
+    Returns the accepted path as a list of **node indices** (so the caller can both
+    read the tokens and gather those nodes' hidden states) and the bonus token.
+    """
     p = prefix_len
     children: dict[int, list[int]] = defaultdict(list)
     for t, par in enumerate(parents):
@@ -45,6 +52,6 @@ def accept_tree_greedy(
         truth = int(logits[cur_pos].argmax())
         nxt = next((t for t in children.get(cur_parent, []) if int(node_tokens[t]) == truth), None)
         if nxt is None:
-            return [int(node_tokens[t]) for t in path], truth
+            return path, truth
         path.append(nxt)
         cur_parent, cur_pos = nxt, p + nxt
