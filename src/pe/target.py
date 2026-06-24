@@ -1,0 +1,130 @@
+"""Frozen target-model wrapper.
+
+The target is never trained. This wrapper exposes exactly what the rest of the
+system needs from it:
+
+- **fused hidden states** — the concatenation of an early, a middle, and a late
+  decoder layer's outputs, which become the drafter's per-position context;
+- a **masked verification forward** that accepts an arbitrary additive attention
+  bias and explicit position ids, so a flattened candidate *tree* can be scored
+  in a single pass;
+- the (frozen, weight-tied) token embedding and LM head that the drafter borrows.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from .config import TargetConfig
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+@dataclass
+class TargetOutput:
+    logits: torch.Tensor  # (B, S, V)
+    fused: torch.Tensor  # (B, S, num_feature_layers * H)
+
+
+class TargetModel:
+    """Thin, frozen wrapper around a causal LM."""
+
+    def __init__(self, cfg: TargetConfig, model=None, tokenizer=None):
+        self.cfg = cfg
+        self.dtype = _DTYPES[cfg.dtype]
+        if model is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name, torch_dtype=self.dtype
+            )
+        self.model = model.to(cfg.device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        if tokenizer is None and model is not None:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+            except Exception:  # noqa: BLE001 - tests pass a model with no hub entry
+                tokenizer = None
+        self.tokenizer = tokenizer
+
+        hidden_layers = self.model.config.num_hidden_layers
+        self.feature_layers = self._resolve_feature_layers(cfg.feature_layers, hidden_layers)
+
+    @staticmethod
+    def _resolve_feature_layers(layers: tuple[int, ...], num_layers: int) -> tuple[int, ...]:
+        """Map (possibly negative / out-of-range) indices onto valid hidden-state slots.
+
+        ``output_hidden_states`` returns ``num_layers + 1`` tensors (index 0 is the
+        embedding output). We index into that list, clamping so tiny test models
+        still get three distinct layers.
+        """
+        n = num_layers  # last valid hidden-state index
+        out = []
+        for layer in layers:
+            idx = layer if layer >= 0 else n + 1 + layer
+            idx = max(1, min(idx, n))
+            out.append(idx)
+        # Keep them distinct and sorted when the model is too shallow for the defaults.
+        if len(set(out)) < len(out):
+            out = sorted({max(1, min(round(n * frac), n)) for frac in (0.25, 0.55, 0.95)})
+            while len(out) < len(layers):
+                out.append(out[-1])
+        return tuple(out)
+
+    @property
+    def config(self):
+        return self.model.config
+
+    @property
+    def hidden_size(self) -> int:
+        return self.model.config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.model.config.vocab_size
+
+    @property
+    def num_feature_layers(self) -> int:
+        return len(self.feature_layers)
+
+    @property
+    def feature_dim(self) -> int:
+        return self.hidden_size * self.num_feature_layers
+
+    def get_input_embeddings(self) -> torch.nn.Module:
+        return self.model.get_input_embeddings()
+
+    def get_lm_head(self) -> torch.nn.Module:
+        return self.model.get_output_embeddings()
+
+    def _fuse(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return torch.cat([hidden_states[i] for i in self.feature_layers], dim=-1)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> TargetOutput:
+        """Run the target and return logits plus fused hidden states.
+
+        ``attention_mask`` may be a standard 2D padding mask or a 4D additive bias
+        (``(B, 1, q, kv)``) for tree verification; both are passed through to the
+        underlying model unchanged.
+        """
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        return TargetOutput(logits=out.logits, fused=self._fuse(out.hidden_states))
