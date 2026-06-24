@@ -11,9 +11,9 @@ def test_package_imports():
     assert pe.__version__
 
 
-def test_target_feature_layers_distinct():
-    cfg = TargetConfig()
-    assert len(set(cfg.feature_layers)) == len(cfg.feature_layers)
+def test_target_feature_layers_default_is_auto():
+    # None means "pick depth-relative layers from the loaded model".
+    assert TargetConfig().feature_layers is None
 
 
 def test_drafter_dims_are_deferred_to_target():

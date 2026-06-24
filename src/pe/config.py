@@ -19,9 +19,11 @@ class TargetConfig:
     """How to load the frozen target and which hidden states to expose."""
 
     model_name: str = DEFAULT_TARGET
-    # Decoder layer indices whose hidden states are fused into the drafter input
-    # (an early, a middle, and a late layer). Filled/validated against the model.
-    feature_layers: tuple[int, ...] = (2, 8, 15)
+    # Decoder layers whose hidden states are fused into the drafter input. ``None``
+    # selects depth-relative layers (≈ a quarter, middle, and near-final layer), so
+    # the fusion always includes a representation close to what the LM head
+    # consumes. An explicit tuple of indices overrides this.
+    feature_layers: tuple[int, ...] | None = None
     dtype: str = "bfloat16"
     device: str = "cuda"
 

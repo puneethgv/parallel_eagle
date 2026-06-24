@@ -2,6 +2,8 @@
 
 import torch
 
+from pe.target import TargetModel
+
 
 def test_feature_dim_and_forward(tiny_target):
     t = tiny_target
@@ -15,8 +17,15 @@ def test_feature_dim_and_forward(tiny_target):
 
 
 def test_feature_layers_distinct_on_shallow_model(tiny_target):
-    # The 4-layer model can't honor the (2, 8, 15) defaults verbatim; the wrapper
-    # must still pick three distinct, in-range hidden-state indices.
+    # Depth-relative auto-selection still yields three distinct, in-range layers
+    # even for a shallow 4-layer model.
     layers = tiny_target.feature_layers
     assert len(set(layers)) == 3
     assert all(1 <= idx <= tiny_target.config.num_hidden_layers for idx in layers)
+
+
+def test_auto_feature_layers_include_near_final():
+    # For a deep model, auto-selection must include a near-output layer.
+    layers = TargetModel._resolve_feature_layers(None, 24)
+    assert len(set(layers)) == 3
+    assert max(layers) >= 20

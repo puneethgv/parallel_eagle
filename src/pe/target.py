@@ -56,14 +56,20 @@ class TargetModel:
         self.feature_layers = self._resolve_feature_layers(cfg.feature_layers, hidden_layers)
 
     @staticmethod
-    def _resolve_feature_layers(layers: tuple[int, ...], num_layers: int) -> tuple[int, ...]:
-        """Map (possibly negative / out-of-range) indices onto valid hidden-state slots.
+    def _resolve_feature_layers(
+        layers: tuple[int, ...] | None, num_layers: int
+    ) -> tuple[int, ...]:
+        """Map requested indices onto valid hidden-state slots.
 
         ``output_hidden_states`` returns ``num_layers + 1`` tensors (index 0 is the
-        embedding output). We index into that list, clamping so tiny test models
-        still get three distinct layers.
+        embedding output). ``None`` picks depth-relative layers (≈ quarter / middle /
+        near-final) so the fusion includes a near-output representation regardless of
+        model depth. Explicit (possibly negative / out-of-range) indices are clamped,
+        and tiny test models still get three distinct layers.
         """
         n = num_layers  # last valid hidden-state index
+        if layers is None:
+            layers = tuple(round(n * f) for f in (0.25, 0.55, 0.95))
         out = []
         for layer in layers:
             idx = layer if layer >= 0 else n + 1 + layer
