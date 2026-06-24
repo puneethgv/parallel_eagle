@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from .config import FeatureConfig, TargetConfig
-from .target import TargetModel
+from .target import TargetModel, dump_target_heads
 
 
 def _example_to_ids(example: dict, tokenizer, max_len: int) -> torch.Tensor | None:
@@ -50,6 +50,10 @@ def extract_features(fcfg: FeatureConfig, tcfg: TargetConfig) -> Path:
     ds = load_dataset(fcfg.dataset, split=fcfg.split, streaming=True)
     out_dir = Path(fcfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dump the (frozen) embedding + LM-head once so training never reloads the
+    # target — and never needs the quantization library.
+    dump_target_heads(target.model, out_dir / "heads.pt")
 
     shards: list[str] = []
     buf: list[dict] = []
@@ -104,6 +108,8 @@ class FeatureDataset:
         self.dir = Path(cache_dir)
         self.manifest = json.loads((self.dir / "manifest.json").read_text())
         self.feature_dim = self.manifest["feature_dim"]
+        self.feature_layers = tuple(self.manifest.get("feature_layers", ()))
+        self.heads_dump = self.dir / "heads.pt"
 
     def __len__(self) -> int:
         return self.manifest["num_examples"]

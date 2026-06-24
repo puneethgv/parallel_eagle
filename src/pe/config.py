@@ -26,6 +26,10 @@ class TargetConfig:
     feature_layers: tuple[int, ...] | None = None
     dtype: str = "bfloat16"
     device: str = "cuda"
+    # Pre-quantized checkpoints (4-bit) are detected automatically and loaded with
+    # a device map; override the placement here if needed. ``dtype`` is ignored for
+    # quantized targets (their compute dtype comes from the checkpoint).
+    device_map: object | None = None
 
 
 @dataclass

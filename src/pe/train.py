@@ -18,7 +18,7 @@ from .config import DrafterConfig, TargetConfig, TrainConfig
 from .drafter import ParallelDrafter
 from .features import FeatureDataset
 from .partition import mtp_backward
-from .target import load_target_heads
+from .target import load_heads_from_dump, load_target_heads
 
 _DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
@@ -46,8 +46,13 @@ def train(tcfg: TargetConfig, dcfg: DrafterConfig, tr: TrainConfig, dtype: str =
     torch.manual_seed(tr.seed)
     param_dtype = _DTYPES[dtype]
 
-    heads = load_target_heads(tcfg)
     data = FeatureDataset(tr.feature_cache_dir)
+    if data.heads_dump.exists():
+        # Lean path: rebuild shared embed/LM head from the dump (no model, no
+        # quantization library) — essential for the 7B int4 target.
+        heads = load_heads_from_dump(data.heads_dump, tcfg, data.feature_layers)
+    else:
+        heads = load_target_heads(tcfg)
     if data.feature_dim != heads.feature_dim:
         raise ValueError(
             f"cached feature_dim {data.feature_dim} != target feature_dim {heads.feature_dim}; "

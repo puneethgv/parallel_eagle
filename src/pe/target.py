@@ -16,9 +16,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from .config import TargetConfig
+
+
+def _is_quantized(model_name: str) -> bool:
+    try:
+        cfg = AutoConfig.from_pretrained(model_name)
+    except Exception:  # noqa: BLE001 - local/test models with no hub config
+        return False
+    return getattr(cfg, "quantization_config", None) is not None
+
+
+def _load_target_model(cfg: TargetConfig, dtype):
+    """Load a target, taking the device-map path for pre-quantized checkpoints."""
+    if _is_quantized(cfg.model_name):
+        device_map = cfg.device_map or {"": cfg.device}
+        model = AutoModelForCausalLM.from_pretrained(cfg.model_name, device_map=device_map)
+        return model, True
+    return AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=dtype), False
+
+
+def materialize_fp16_weight(module: torch.nn.Module) -> torch.Tensor:
+    """Return a plain fp16 weight for a linear/embedding, dequantizing 4-bit if needed."""
+    w = module.weight
+    if w.__class__.__name__ == "Params4bit":
+        import bitsandbytes.functional as bnbf
+
+        return bnbf.dequantize_4bit(w.data, w.quant_state).to(torch.float16).cpu()
+    return w.data.to(torch.float16).cpu()
 
 _DTYPES = {
     "float32": torch.float32,
@@ -39,9 +66,13 @@ class TargetModel:
     def __init__(self, cfg: TargetConfig, model=None, tokenizer=None):
         self.cfg = cfg
         self.dtype = _DTYPES[cfg.dtype]
+        quantized = False
         if model is None:
-            model = AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=self.dtype)
-        self.model = model.to(cfg.device).eval()
+            model, quantized = _load_target_model(cfg, self.dtype)
+        # A 4-bit model is already placed by its device map and must not be moved.
+        self.model = (model if quantized else model.to(cfg.device)).eval()
+        if quantized:
+            self.dtype = self.model.get_input_embeddings().weight.dtype
         for p in self.model.parameters():
             p.requires_grad_(False)
 
@@ -162,30 +193,68 @@ class TargetHeads:
         return self.head
 
 
-def load_target_heads(cfg: TargetConfig) -> TargetHeads:
-    """Load only the embedding and LM head onto the device; free the rest."""
-    import gc
-
-    dtype = _DTYPES[cfg.dtype]
-    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=dtype)
-    config = model.config
-    feature_layers = TargetModel._resolve_feature_layers(
-        cfg.feature_layers, config.num_hidden_layers
-    )
-    embed = model.get_input_embeddings().to(cfg.device)
-    head = model.get_output_embeddings().to(cfg.device)
+def _heads_from_weights(
+    config, embed_w: torch.Tensor, head_w: torch.Tensor, feature_layers, device, dtype
+) -> TargetHeads:
+    vocab, hidden = embed_w.shape
+    embed = torch.nn.Embedding(vocab, hidden)
+    embed.weight.data = embed_w.to(dtype)
+    head = torch.nn.Linear(hidden, head_w.shape[0], bias=False)
+    head.weight.data = head_w.to(dtype)
     for m in (embed, head):
+        m.to(device)
         for p in m.parameters():
             p.requires_grad_(False)
-    heads = TargetHeads(
+    return TargetHeads(
         config=config,
         hidden_size=config.hidden_size,
         vocab_size=config.vocab_size,
         feature_dim=config.hidden_size * len(feature_layers),
         num_feature_layers=len(feature_layers),
-        feature_layers=feature_layers,
+        feature_layers=tuple(feature_layers),
         embed=embed,
         head=head,
+    )
+
+
+def dump_target_heads(model, path) -> None:
+    """Save fp16 embedding + LM-head weights (dequantizing 4-bit) for lean training."""
+    torch.save(
+        {
+            "embed": materialize_fp16_weight(model.get_input_embeddings()),
+            "head": materialize_fp16_weight(model.get_output_embeddings()),
+        },
+        path,
+    )
+
+
+def load_heads_from_dump(
+    dump_path, cfg: TargetConfig, feature_layers, feature_dim_check: int | None = None
+) -> TargetHeads:
+    """Build shared heads from a dumped weight file + the target config (no model load)."""
+    config = AutoConfig.from_pretrained(cfg.model_name)
+    fl = TargetModel._resolve_feature_layers(feature_layers, config.num_hidden_layers)
+    w = torch.load(dump_path, map_location="cpu", weights_only=False)
+    return _heads_from_weights(config, w["embed"], w["head"], fl, cfg.device, _DTYPES[cfg.dtype])
+
+
+def load_target_heads(cfg: TargetConfig) -> TargetHeads:
+    """Load only the embedding and LM head onto the device; free the rest."""
+    import gc
+
+    model, quantized = _load_target_model(cfg, _DTYPES[cfg.dtype])
+    config = model.config
+    feature_layers = TargetModel._resolve_feature_layers(
+        cfg.feature_layers, config.num_hidden_layers
+    )
+    dtype = model.get_input_embeddings().weight.dtype if quantized else _DTYPES[cfg.dtype]
+    heads = _heads_from_weights(
+        config,
+        materialize_fp16_weight(model.get_input_embeddings()),
+        materialize_fp16_weight(model.get_output_embeddings()),
+        feature_layers,
+        cfg.device,
+        dtype,
     )
     del model
     gc.collect()
