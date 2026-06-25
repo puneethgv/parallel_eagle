@@ -47,6 +47,7 @@ class ParallelDrafter(nn.Module):
         max_depth: int,
         embed_module: nn.Module,
         lm_head_module: nn.Module,
+        final_norm_module: nn.Module,
     ):
         super().__init__()
         self.hidden = hidden
@@ -69,14 +70,15 @@ class ParallelDrafter(nn.Module):
             DecoderLayer(hidden, n_heads, n_kv_heads, intermediate, rope_theta, eps)
             for _ in range(num_layers)
         )
-        self.norm = RMSNorm(hidden, eps)
         nn.init.normal_(self.mask_emb, std=0.02)
         nn.init.normal_(self.h_shared, std=0.02)
 
         # Shared + frozen; stashed in tuples so they are not registered as
-        # submodules (kept out of the optimizer and the drafter checkpoint).
+        # submodules (kept out of the optimizer and the drafter checkpoint). The
+        # final norm is shared too, so the drafter outputs in the LM head's scale.
         self._embed = (embed_module,)
         self._lm_head = (lm_head_module,)
+        self._final_norm = (final_norm_module,)
         self.grad_checkpoint = False
 
     # ------------------------------------------------------------------ #
@@ -98,6 +100,7 @@ class ParallelDrafter(nn.Module):
             max_depth=dcfg.max_depth,
             embed_module=target.get_input_embeddings(),
             lm_head_module=target.get_lm_head(),
+            final_norm_module=target.get_final_norm(),
         )
         return model
 
@@ -153,7 +156,7 @@ class ParallelDrafter(nn.Module):
                 x = checkpoint(layer, x, cos, sin, bias, use_reentrant=False)
             else:
                 x = layer(x, cos, sin, bias)
-        return self.norm(x)
+        return self._final_norm[0](x)
 
     # ------------------------------------------------------------------ #
     # Training: pack one example into the parallel-MTP layout

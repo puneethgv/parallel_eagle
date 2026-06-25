@@ -139,6 +139,11 @@ class TargetModel:
     def get_lm_head(self) -> torch.nn.Module:
         return self.model.get_output_embeddings()
 
+    def get_final_norm(self) -> torch.nn.Module:
+        """The target's final RMSNorm — shared (frozen) so the drafter's output is
+        in exactly the scale the LM head expects."""
+        return self.model.model.norm
+
     def _fuse(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return torch.cat([hidden_states[i] for i in self.feature_layers], dim=-1)
 
@@ -212,6 +217,7 @@ class TargetHeads:
     feature_layers: tuple[int, ...]
     embed: torch.nn.Module
     head: torch.nn.Module
+    norm: torch.nn.Module
 
     def get_input_embeddings(self):
         return self.embed
@@ -219,16 +225,23 @@ class TargetHeads:
     def get_lm_head(self):
         return self.head
 
+    def get_final_norm(self):
+        return self.norm
+
 
 def _heads_from_weights(
-    config, embed_w: torch.Tensor, head_w: torch.Tensor, feature_layers, device, dtype
+    config, embed_w: torch.Tensor, head_w: torch.Tensor, norm_w: torch.Tensor, feature_layers, device, dtype
 ) -> TargetHeads:
+    from .nn import RMSNorm
+
     vocab, hidden = embed_w.shape
     embed = torch.nn.Embedding(vocab, hidden)
     embed.weight.data = embed_w.to(dtype)
     head = torch.nn.Linear(hidden, head_w.shape[0], bias=False)
     head.weight.data = head_w.to(dtype)
-    for m in (embed, head):
+    norm = RMSNorm(hidden, getattr(config, "rms_norm_eps", 1e-5))
+    norm.weight.data = norm_w.to(dtype)
+    for m in (embed, head, norm):
         m.to(device)
         for p in m.parameters():
             p.requires_grad_(False)
@@ -241,15 +254,17 @@ def _heads_from_weights(
         feature_layers=tuple(feature_layers),
         embed=embed,
         head=head,
+        norm=norm,
     )
 
 
 def dump_target_heads(model, path) -> None:
-    """Save fp16 embedding + LM-head weights (dequantizing 4-bit) for lean training."""
+    """Save fp16 embedding, LM-head, and final-norm weights for lean training."""
     torch.save(
         {
             "embed": materialize_fp16_weight(model.get_input_embeddings()),
             "head": materialize_fp16_weight(model.get_output_embeddings()),
+            "norm": model.model.norm.weight.data.to(torch.float16).cpu(),
         },
         path,
     )
@@ -262,7 +277,9 @@ def load_heads_from_dump(
     config = AutoConfig.from_pretrained(cfg.model_name)
     fl = TargetModel._resolve_feature_layers(feature_layers, config.num_hidden_layers)
     w = torch.load(dump_path, map_location="cpu", weights_only=False)
-    return _heads_from_weights(config, w["embed"], w["head"], fl, cfg.device, _DTYPES[cfg.dtype])
+    return _heads_from_weights(
+        config, w["embed"], w["head"], w["norm"], fl, cfg.device, _DTYPES[cfg.dtype]
+    )
 
 
 def load_target_heads(cfg: TargetConfig) -> TargetHeads:
@@ -279,6 +296,7 @@ def load_target_heads(cfg: TargetConfig) -> TargetHeads:
         config,
         materialize_fp16_weight(model.get_input_embeddings()),
         materialize_fp16_weight(model.get_output_embeddings()),
+        model.model.norm.weight.data.to(torch.float16),
         feature_layers,
         cfg.device,
         dtype,
