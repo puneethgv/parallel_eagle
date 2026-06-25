@@ -72,6 +72,35 @@ def accept_chain_cached(
     return [int(t) for t in draft_tokens[:a]], bonus
 
 
+def accept_chain_sampling(
+    target_dists: torch.Tensor,
+    draft_tokens: list[int],
+    q_dists: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[list[int], int]:
+    """Lossless speculative-sampling acceptance for a chain.
+
+    ``target_dists`` (K+1, V) are the target's distributions at each draft position
+    plus the trailing position; ``q_dists`` (K, V) are the drafter's. Accept draft
+    ``i`` with probability ``min(1, p_i / q_i)``; on rejection sample the bonus from
+    the residual ``norm(relu(p - q))``; if all accept, sample from the trailing
+    target distribution. The emitted token stream is distributed exactly as samples
+    from the target."""
+    accepted: list[int] = []
+    for i, tok in enumerate(draft_tokens):
+        p = target_dists[i, tok]
+        q = q_dists[i, tok]
+        u = torch.rand((), generator=generator, device=target_dists.device)
+        if u < torch.clamp(p / q, max=1.0):
+            accepted.append(int(tok))
+        else:
+            residual = torch.clamp(target_dists[i] - q_dists[i], min=0)
+            residual = residual / residual.sum()
+            return accepted, int(torch.multinomial(residual, 1, generator=generator))
+    bonus = int(torch.multinomial(target_dists[len(draft_tokens)], 1, generator=generator))
+    return accepted, bonus
+
+
 def accept_tree_cached(
     root_logit: torch.Tensor,
     node_logits: torch.Tensor,

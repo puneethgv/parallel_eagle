@@ -24,12 +24,13 @@ from collections.abc import Callable
 import torch
 
 from .decode.baselines import vanilla_generate  # noqa: F401 (re-export)
-from .decode.chain import propose_chain, propose_chain_sequential
+from .decode.chain import propose_chain, propose_chain_sampling, propose_chain_sequential
 from .decode.result import GenResult
 from .decode.tree import propose_tree
 from .decode.verify import (
     accept_chain_cached,
     accept_chain_greedy,
+    accept_chain_sampling,
     accept_tree_cached,
     accept_tree_greedy,
 )
@@ -37,7 +38,12 @@ from .drafter import ParallelDrafter
 from .masks import to_additive_bias, tree_allow_mask, tree_position_ids
 from .target import TargetModel
 
-__all__ = ["generate_speculative", "generate_speculative_cached", "vanilla_generate"]
+__all__ = [
+    "generate_speculative",
+    "generate_speculative_cached",
+    "generate_speculative_sampling",
+    "vanilla_generate",
+]
 
 _CHAIN_MODES = {"chain", "sequential"}
 
@@ -114,6 +120,89 @@ def generate_speculative(
             on_commit([*committed, bonus])
         if eos_token_id is not None and (bonus == eos_token_id or eos_token_id in committed):
             stop = True
+
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    return GenResult(
+        output_ids=seq[base : base + max_new_tokens],
+        steps=steps,
+        target_calls=target_calls,
+        drafter_calls=drafter_calls,
+        accepted_tokens=accepted,
+        num_generated=min(len(seq) - base, max_new_tokens),
+        seconds=time.perf_counter() - t0,
+    )
+
+
+@torch.no_grad()
+def generate_speculative_sampling(
+    target: TargetModel,
+    drafter: ParallelDrafter,
+    prompt_ids: list[int],
+    *,
+    k: int,
+    max_new_tokens: int = 256,
+    temperature: float = 1.0,
+    eos_token_id: int | None = None,
+    seed: int = 0,
+    on_commit: Callable[[list[int]], None] | None = None,
+) -> GenResult:
+    """Lossless speculative *sampling* (temperature > 0), KV-cached chain variant.
+
+    Drafts are sampled from the drafter; the target verifies them with the
+    rejection-sampling rule (:func:`accept_chain_sampling`), so the emitted tokens
+    are distributed exactly as if sampled from the target."""
+    dev = target.device
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    seq = list(prompt_ids)
+    base = len(seq)
+
+    cache = target.make_cache()
+    pos = torch.arange(len(seq), device=dev).unsqueeze(0)
+    logits, fused, cache = target.forward_cached(
+        torch.tensor(seq, device=dev).unsqueeze(0), cache, pos
+    )
+    feats = fused[0]
+    cache_len = len(seq)
+    root_logit = logits[0, -1]
+    target_calls, drafter_calls, accepted, steps = 1, 0, 0, 0
+    stop = False
+    t0 = time.perf_counter()
+
+    while len(seq) - base < max_new_tokens and not stop:
+        ctx = torch.tensor(seq[:cache_len], device=dev)
+        drafts, q = propose_chain_sampling(drafter, ctx, feats, k, temperature, gen)
+        drafter_calls += 1
+        npos = torch.arange(cache_len, cache_len + k, device=dev).unsqueeze(0)
+        vlogits, _, cache = target.forward_cached(
+            torch.tensor(drafts, device=dev).unsqueeze(0), cache, npos
+        )
+        target_calls += 1
+        tlog = torch.cat([root_logit.unsqueeze(0), vlogits[0]], dim=0)  # (k+1, V)
+        target_dists = torch.softmax(tlog.float() / temperature, dim=-1)
+        acc, bonus = accept_chain_sampling(target_dists, drafts, q, gen)
+
+        committed = [*acc, bonus]
+        cache.crop(cache_len)
+        cpos = torch.arange(cache_len, cache_len + len(committed), device=dev).unsqueeze(0)
+        clogits, cfused, cache = target.forward_cached(
+            torch.tensor(committed, device=dev).unsqueeze(0), cache, cpos
+        )
+        target_calls += 1
+        feats = torch.cat([feats, cfused[0]], dim=0)
+        cache_len += len(committed)
+        root_logit = clogits[0, -1]
+        accepted += len(acc)
+        steps += 1
+        for tok in committed:
+            seq.append(tok)
+            if on_commit is not None:
+                on_commit([tok])
+            if eos_token_id is not None and tok == eos_token_id:
+                stop = True
+                break
+            if len(seq) - base >= max_new_tokens:
+                break
 
     if dev.type == "cuda":
         torch.cuda.synchronize()
