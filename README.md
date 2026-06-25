@@ -103,8 +103,15 @@ pip install -e ".[dev]"          # add CUDA torch per your platform; ".[train]" 
 
 ## Quickstart
 
-The defaults target `Qwen/Qwen2.5-0.5B-Instruct` (open, fits 8 GB). Any causal LM
-with hidden states + an LM head works via `--target`.
+Verify the whole pipeline (features → train → tree drafting → lossless decode) on a
+toy model in seconds, on CPU, with **no downloads**:
+
+```bash
+make quickstart
+```
+
+The full pipeline on a real target (defaults to `Qwen/Qwen2.5-0.5B-Instruct`; any
+causal LM with hidden states + an LM head works via `--target`):
 
 ```bash
 # 1) cache the frozen target's fused hidden states over training data
@@ -122,6 +129,16 @@ python bench/plot.py
 
 # memory-scaling demonstration of sequence partitioning
 python bench/mem_scaling.py --segments 1 2 3 6
+```
+
+Scaling to an **int4 7B** target (a pre-quantized checkpoint, ~4 GB, fits 8 GB;
+needs `pip install bitsandbytes`):
+
+```bash
+T=unsloth/mistral-7b-instruct-v0.3-bnb-4bit
+python -m pe.features --target $T --dataset tatsu-lab/alpaca --max-examples 3000 --max-seq-len 256
+python -m pe.train    --target $T --dtype bfloat16 --num-layers 4 --num-segments 4
+python bench/demo.py  --target $T --stream            # side-by-side vs naive, KV-cached
 ```
 
 ## Results
