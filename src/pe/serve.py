@@ -142,14 +142,16 @@ def generate_speculative_cached(
     eos_token_id: int | None = None,
     on_commit: Callable[[list[int]], None] | None = None,
 ) -> GenResult:
-    """KV-cache speculative decoding.
+    """One-forward KV-cache speculative decoding.
 
-    A persistent cache holds the confirmed prefix, so each step does only two
-    *incremental* target forwards — verify the candidate tree over cached keys,
-    then commit the accepted path + bonus — instead of recomputing the prefix.
-    Every confirmed token (including the bonus) is featurized by the commit pass,
-    so the drafter always proposes the *easy next token* at depth 0, which is what
-    lets acceptance translate into a wall-clock speedup. Lossless by construction.
+    A persistent cache holds the confirmed prefix. Each step usually does a *single*
+    target forward: the drafter proposes the easy next token at depth 0 (re-rooting
+    on the most recent bonus), the target verifies the candidate tree over the cache,
+    and the accepted path's KV is kept by index-selecting the cache (rejected branches
+    dropped) — so no separate commit pass is needed. The bonus is emitted but left
+    "pending" (re-confirmed at depth 0 next step); on the rare step where the drafter
+    misses it, a single 1-token forward featurizes it. Net target forwards per token
+    approach ``1 / acceptance_length``. Lossless by construction.
     """
     if mode not in _CHAIN_MODES and mode != "tree":
         raise ValueError(f"unknown mode {mode!r}")
@@ -162,15 +164,21 @@ def generate_speculative_cached(
     logits, fused, cache = target.forward_cached(
         torch.tensor(seq, device=dev).unsqueeze(0), cache, pos
     )
-    feats = fused[0]
+    feats = fused[0]  # features for the cache_len featurized tokens
+    cache_len = len(seq)
     root_logit = logits[0, -1]
     target_calls, drafter_calls, accepted, steps = 1, 0, 0, 0
-    stop = False
+
+    # Seed the first pending bonus so the loop invariant holds (cache_len == len(seq) - 1).
+    bonus = int(root_logit.argmax())
+    seq.append(bonus)
+    if on_commit is not None:
+        on_commit([bonus])
+    stop = eos_token_id is not None and bonus == eos_token_id
     t0 = time.perf_counter()
 
     while len(seq) - base < max_new_tokens and not stop:
-        length = len(seq)
-        ctx = torch.tensor(seq, device=dev)
+        ctx = torch.tensor(seq[:cache_len], device=dev)
 
         if mode in _CHAIN_MODES:
             if mode == "chain":
@@ -179,44 +187,67 @@ def generate_speculative_cached(
             else:
                 drafts = propose_chain_sequential(drafter, ctx, feats, k)
                 drafter_calls += k
-            npos = torch.arange(length, length + len(drafts), device=dev).unsqueeze(0)
-            vlogits, _, cache = target.forward_cached(
+            npos = torch.arange(cache_len, cache_len + len(drafts), device=dev).unsqueeze(0)
+            vlogits, vfused, cache = target.forward_cached(
                 torch.tensor(drafts, device=dev).unsqueeze(0), cache, npos
             )
             target_calls += 1
-            committed_acc, bonus = accept_chain_cached(root_logit, vlogits[0], drafts)
+            acc_tokens, new_bonus = accept_chain_cached(root_logit, vlogits[0], drafts)
+            a = len(acc_tokens)
+            keep_extra = list(range(cache_len, cache_len + a))
+            path_feats = vfused[0][:a]
+            new_root = root_logit if a == 0 else vlogits[0][a - 1]
         else:
-            node_tokens, parents = propose_tree(
-                drafter, ctx, feats, k, tree_top_k, tree_max_nodes
-            )
+            node_tokens, parents = propose_tree(drafter, ctx, feats, k, tree_top_k, tree_max_nodes)
             drafter_calls += 1
-            allow = tree_allow_mask(parents, length, device=dev)[length:, :]
+            allow = tree_allow_mask(parents, cache_len, device=dev)[cache_len:, :]
             bias = to_additive_bias(allow, target.dtype)
-            npos = tree_position_ids(parents, length, device=dev)[length:].unsqueeze(0)
-            vlogits, _, cache = target.forward_cached(
+            npos = tree_position_ids(parents, cache_len, device=dev)[cache_len:].unsqueeze(0)
+            vlogits, vfused, cache = target.forward_cached(
                 torch.tensor(node_tokens, device=dev).unsqueeze(0), cache, npos, attention_mask=bias
             )
             target_calls += 1
-            path, bonus = accept_tree_cached(root_logit, vlogits[0], node_tokens, parents)
-            committed_acc = [node_tokens[t] for t in path]
+            path, new_bonus = accept_tree_cached(root_logit, vlogits[0], node_tokens, parents)
+            acc_tokens = [node_tokens[t] for t in path]
+            keep_extra = [cache_len + t for t in path]
+            path_feats = vfused[0][path] if path else vfused[0][:0]
+            new_root = root_logit if not path else vlogits[0][path[-1]]
 
-        committed = [*committed_acc, bonus]
-        cache.crop(length)
-        cpos = torch.arange(length, length + len(committed), device=dev).unsqueeze(0)
-        clogits, cfused, cache = target.forward_cached(
-            torch.tensor(committed, device=dev).unsqueeze(0), cache, cpos
-        )
-        target_calls += 1
-        feats = torch.cat([feats, cfused[0]], dim=0)
-        root_logit = clogits[0, -1]
+        if acc_tokens:
+            # acc_tokens[0] re-confirms the pending bonus (already emitted); keep the
+            # accepted path's KV + features, drop the rest, and re-root.
+            keep = torch.tensor(list(range(cache_len)) + keep_extra, device=dev)
+            target.gather_cache(cache, keep)
+            feats = torch.cat([feats, path_feats], dim=0)
+            cache_len += len(acc_tokens)
+            root_logit = new_root
+            emit = [*acc_tokens[1:], int(new_bonus)]
+            accepted += len(acc_tokens) - 1
+        else:
+            # Drafter missed the easy re-prediction; featurize the pending bonus with
+            # a single 1-token forward.
+            pending = seq[cache_len]
+            cache.crop(cache_len)
+            bpos = torch.tensor([[cache_len]], device=dev)
+            blogits, bfused, cache = target.forward_cached(
+                torch.tensor([[pending]], device=dev), cache, bpos
+            )
+            target_calls += 1
+            feats = torch.cat([feats, bfused[0]], dim=0)
+            cache_len += 1
+            root_logit = blogits[0, -1]
+            emit = [int(root_logit.argmax())]
 
-        accepted += len(committed_acc)
         steps += 1
-        seq.extend(committed)
-        if on_commit is not None:
-            on_commit(committed)
-        if eos_token_id is not None and (bonus == eos_token_id or eos_token_id in committed_acc):
-            stop = True
+        for tok in emit:
+            seq.append(tok)
+            if on_commit is not None:
+                on_commit([tok])
+            if eos_token_id is not None and tok == eos_token_id:
+                stop = True
+                break
+            if len(seq) - base >= max_new_tokens:
+                break
 
     if dev.type == "cuda":
         torch.cuda.synchronize()

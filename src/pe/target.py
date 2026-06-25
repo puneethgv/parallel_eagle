@@ -177,6 +177,15 @@ class TargetModel:
     def make_cache() -> DynamicCache:
         return DynamicCache()
 
+    @staticmethod
+    def gather_cache(cache: DynamicCache, keep_index: torch.Tensor) -> None:
+        """Keep only ``keep_index`` positions (sequence dim) of every layer's K/V,
+        in place. Used to drop rejected tree branches and retain just the accepted
+        path's KV, so the one-forward loop needs no separate commit pass."""
+        for layer in cache.layers:
+            layer.keys = layer.keys.index_select(2, keep_index).contiguous()
+            layer.values = layer.values.index_select(2, keep_index).contiguous()
+
     @torch.no_grad()
     def forward_cached(
         self,
