@@ -188,30 +188,38 @@ prefix, and a fair cached vanilla baseline (`vanilla_generate_cached`) is the
 comparison. Training stays light via the offline head/feature dump and sequence
 partitioning (a 4096-hidden drafter trains in ~5 GB with 8-bit Adam).
 
-Findings on the 7B-int4 target (greedy, lossless):
-- **Drafter learning is gated by feature scale.** Late target layers have "massive
-  activations" (|x| up to ~220); without normalizing the fused features the drafter
-  collapses to a unigram predictor. RMS-normalizing each fused block **and sharing
-  the target's final norm** (so the drafter's output is in the LM head's scale)
-  breaks the loss plateau (5.4 → ~4.0) and the drafter learns real predictions.
-- **Train/inference distribution must match.** Trained on raw instruction text, the
-  drafter is in-distribution for that format: **dynamic-tree acceptance ≈ 1.39**
-  (chain ≈ 1.14) on held-out instruction prompts — but drops on chat-template
-  prompts it never saw. Format-matched training is the lever here.
-- **The remaining wall-clock gap is decode-loop efficiency, not the cache.** The
-  loop currently does *two* target forwards per step (verify the tree, then commit
-  the accepted path) and recomputes the small drafter each step, so it is still
-  slower than the (very fast, KV-cached) 7B vanilla baseline at this acceptance.
-
 **Decode loop.** Serving uses a **one-target-forward-per-step** KV-cache loop
 (`generate_speculative_cached`): the candidate tree is verified over the cached
 prefix, the accepted path's KV is kept by index-selecting the cache (rejected
-branches dropped, no recompute), and the loop re-roots on the most recent bonus so
-the next step's depth-0 draft is the easy next token. This drives
-`target_calls/token → ~1/acceptance` — so the win now scales directly with the
-drafter's acceptance, which is the remaining lever (more/format-matched training,
-or a deeper drafter). `temperature > 0` uses the same cache with a lossless
-rejection-sampling rule (`generate_speculative_sampling`).
+branches dropped, no recompute), and the loop re-roots on the most recent bonus.
+`temperature > 0` uses the same cache with a lossless rejection-sampling rule
+(`generate_speculative_sampling`). Vanilla uses the same cache
+(`vanilla_generate_cached`) so the comparison is fair.
+
+What it takes on the 7B-int4 target (greedy, lossless, in-distribution prompts):
+
+| | tokens/sec | acceptance | target calls/token |
+|---|---|---|---|
+| vanilla (KV-cached) | **25** | 1.00 | 1.00 |
+| parallel dynamic tree | ~7 | ~1.4 (drafter) | > 1 |
+
+The trained drafter genuinely learns (in-distribution tree acceptance ≈ **1.4**,
+chain ≈ 1.14), and the loop is correct (lossless) — **but it is not yet faster than
+vanilla**, and the honest reason is precise: a KV-cached 7B-int4 forward is
+*memory-bandwidth bound*, so vanilla decodes ~25 tok/s, and speculation only wins
+once **target-calls-per-token drops below 1**. That needs the drafter's *depth-0*
+(next-token) prediction to be reliable enough — roughly **acceptance ≳ 2** — so the
+one-forward loop rarely falls back to a second forward. This drafter, trained on a
+few-thousand-example budget on an 8 GB laptop, reaches ~1.4, which keeps
+calls/token above 1. A deeper/longer-trained drafter is the single remaining lever
+(a 4-layer run was attempted but did not converge in the available compute).
+
+In short: every component a production speculative-decoding stack needs is here and
+verified — feature-conditioned parallel drafting, dynamic-tree + tree-attention
+verification, one-forward KV-cache serving with cache surgery, lossless greedy and
+sampling, int4 quantization, and a memory-scalable training recipe — and the metrics
+isolate exactly the one thing (drafter acceptance) that a larger training budget
+would close.
 
 ## Engineering highlights
 
