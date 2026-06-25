@@ -16,9 +16,9 @@ from __future__ import annotations
 import argparse
 
 from pe.config import TargetConfig
-from pe.decode.baselines import vanilla_generate
+from pe.decode.baselines import vanilla_generate, vanilla_generate_cached
 from pe.drafter import load_drafter
-from pe.serve import generate_speculative
+from pe.serve import generate_speculative, generate_speculative_cached
 from pe.target import TargetModel
 
 BOLD, RESET = "\033[1m", "\033[0m"
@@ -49,25 +49,27 @@ def run(args):
     eos = target.tokenizer.eos_token_id
     pid = build_prompt(target, args.prompt)
 
+    vgen = vanilla_generate if args.no_cache else vanilla_generate_cached
+    sgen = generate_speculative if args.no_cache else generate_speculative_cached
     spec = dict(
         k=args.k, mode="tree", max_new_tokens=args.max_new_tokens,
         tree_top_k=args.tree_top_k, tree_max_nodes=args.tree_max_nodes, eos_token_id=eos,
     )
     # warm up CUDA kernels
-    vanilla_generate(target, pid, 4, eos)
-    generate_speculative(target, drafter, pid, **{**spec, "max_new_tokens": 4})
+    vgen(target, pid, 4, eos)
+    sgen(target, drafter, pid, **{**spec, "max_new_tokens": 4})
 
     print(f"\nPrompt: {args.prompt}\n" + "=" * 72)
 
     if args.stream:
         print(f"\n{BOLD}[naive autoregressive]{RESET}")
-        v = vanilla_generate(target, pid, args.max_new_tokens, eos, on_commit=streamer(target))
+        v = vgen(target, pid, args.max_new_tokens, eos, on_commit=streamer(target))
         print(f"\n{BOLD}[parallel tree]{RESET}  (bold = multi-token burst)")
-        t = generate_speculative(target, drafter, pid, on_commit=streamer(target), **spec)
+        t = sgen(target, drafter, pid, on_commit=streamer(target), **spec)
         print()
     else:
-        v = vanilla_generate(target, pid, args.max_new_tokens, eos)
-        t = generate_speculative(target, drafter, pid, **spec)
+        v = vgen(target, pid, args.max_new_tokens, eos)
+        t = sgen(target, drafter, pid, **spec)
         print("\nnaive output :", target.tokenizer.decode(v.output_ids, skip_special_tokens=True))
         print("\ntree  output :", target.tokenizer.decode(t.output_ids, skip_special_tokens=True))
 
@@ -89,7 +91,7 @@ def run(args):
     print(
         f"\ntree uses {call_cut:.0f}% fewer target forward passes; "
         f"wall-clock {v.seconds / max(1e-9, t.seconds):.2f}x "
-        f"({'faster' if t.seconds < v.seconds else 'slower — needs a KV cache + stronger drafter'})"
+        f"({'faster' if t.seconds < v.seconds else 'slower'})"
     )
 
 
@@ -105,4 +107,5 @@ if __name__ == "__main__":
     p.add_argument("--tree-top-k", type=int, default=4)
     p.add_argument("--tree-max-nodes", type=int, default=24)
     p.add_argument("--stream", action="store_true")
+    p.add_argument("--no-cache", action="store_true", help="use the recompute loop instead of KV cache")
     run(p.parse_args())

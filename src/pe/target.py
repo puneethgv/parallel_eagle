@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from .config import TargetConfig
 
@@ -167,6 +167,33 @@ class TargetModel:
             use_cache=False,
         )
         return TargetOutput(logits=out.logits, fused=self._fuse(out.hidden_states))
+
+    @staticmethod
+    def make_cache() -> DynamicCache:
+        return DynamicCache()
+
+    @torch.no_grad()
+    def forward_cached(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: DynamicCache,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        """Incremental forward over only the new ``input_ids`` (attending to the
+        cached prefix). Returns logits + fused features for the new tokens and the
+        updated cache. ``attention_mask`` may be a 4D additive bias of shape
+        ``(B, 1, q_new, kv_total)`` for tree verification, or ``None`` for plain
+        causal continuation."""
+        out = self.model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        return out.logits, self._fuse(out.hidden_states), out.past_key_values
 
 
 @dataclass

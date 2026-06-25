@@ -10,7 +10,7 @@ import torch
 from pe.config import DrafterConfig
 from pe.decode.baselines import vanilla_generate
 from pe.drafter import ParallelDrafter
-from pe.serve import generate_speculative
+from pe.serve import generate_speculative, generate_speculative_cached
 
 PROMPT = [1, 2, 3, 4, 5, 6]
 N = 24
@@ -41,6 +41,22 @@ def test_tree_matches_vanilla(tiny_target):
     d = _drafter(tiny_target)
     ref = vanilla_generate(tiny_target, PROMPT, N).output_ids
     res = generate_speculative(
+        tiny_target, d, PROMPT, k=5, mode="tree", max_new_tokens=N, tree_top_k=3, tree_max_nodes=15
+    )
+    assert res.output_ids == ref
+
+
+def test_cached_chain_matches_vanilla(tiny_target):
+    d = _drafter(tiny_target)
+    ref = vanilla_generate(tiny_target, PROMPT, N).output_ids
+    res = generate_speculative_cached(tiny_target, d, PROMPT, k=5, mode="chain", max_new_tokens=N)
+    assert res.output_ids == ref
+
+
+def test_cached_tree_matches_vanilla(tiny_target):
+    d = _drafter(tiny_target)
+    ref = vanilla_generate(tiny_target, PROMPT, N).output_ids
+    res = generate_speculative_cached(
         tiny_target, d, PROMPT, k=5, mode="tree", max_new_tokens=N, tree_top_k=3, tree_max_nodes=15
     )
     assert res.output_ids == ref
