@@ -24,10 +24,22 @@ from .target import TargetModel, dump_target_heads
 def _example_to_ids(example: dict, tokenizer, max_len: int) -> torch.Tensor | None:
     """Best-effort conversion of a dataset row to a single token sequence."""
     ids = None
-    if "messages" in example and getattr(tokenizer, "chat_template", None):
+    has_template = getattr(tokenizer, "chat_template", None)
+    if "messages" in example and has_template:
         res = tokenizer.apply_chat_template(
             example["messages"], tokenize=True, add_generation_prompt=False
         )
+        ids = res["input_ids"] if hasattr(res, "keys") else res
+    elif "instruction" in example and has_template:
+        # Format instruction datasets (e.g. Alpaca) with the chat template so the
+        # drafter trains on the same distribution it will decode in.
+        user = example["instruction"]
+        if example.get("input"):
+            user += "\n" + example["input"]
+        msgs = [{"role": "user", "content": user}]
+        if example.get("output"):
+            msgs.append({"role": "assistant", "content": example["output"]})
+        res = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False)
         ids = res["input_ids"] if hasattr(res, "keys") else res
     elif "text" in example:
         ids = tokenizer(example["text"]).input_ids

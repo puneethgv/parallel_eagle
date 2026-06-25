@@ -152,12 +152,36 @@ The loss is identical across `S` (the partitioned gradient equals the
 full-sequence gradient exactly), yet the context that **OOMs at `S=1` trains
 comfortably at `S=6`** — which is how long-context training fits an 8 GB card.
 
-**On wall-clock.** The generation loop recomputes the prefix each step (no KV
-cache), so absolute tokens/sec speedup is below 1 at this small, lightly-trained
-scale even though the tree already saves target *calls*. Acceptance length and
-call efficiency are the KV-cache-independent algorithmic results; wiring a KV cache
-(so wall-clock tracks target-calls-per-token) and training a larger drafter are the
-two levers to turn the call-efficiency win into a wall-clock win.
+### Scaling up: int4 7B target + KV-cache decoding
+
+The same code runs against a **pre-quantized 4-bit 7B target** (`--target
+unsloth/mistral-7b-instruct-v0.3-bnb-4bit`, ~4 GB, fits 8 GB) with a **KV-cache**
+generation loop (`generate_speculative_cached`): the cache holds the confirmed
+prefix, so each step does incremental target forwards instead of recomputing the
+prefix, and a fair cached vanilla baseline (`vanilla_generate_cached`) is the
+comparison. Training stays light via the offline head/feature dump and sequence
+partitioning (a 4096-hidden drafter trains in ~5 GB with 8-bit Adam).
+
+Findings on the 7B-int4 target (greedy, lossless):
+- **Drafter learning is gated by feature scale.** Late target layers have "massive
+  activations" (|x| up to ~220); without normalizing the fused features the drafter
+  collapses to a unigram predictor. RMS-normalizing each fused block **and sharing
+  the target's final norm** (so the drafter's output is in the LM head's scale)
+  breaks the loss plateau (5.4 → ~4.0) and the drafter learns real predictions.
+- **Train/inference distribution must match.** Trained on raw instruction text, the
+  drafter is in-distribution for that format: **dynamic-tree acceptance ≈ 1.39**
+  (chain ≈ 1.14) on held-out instruction prompts — but drops on chat-template
+  prompts it never saw. Format-matched training is the lever here.
+- **The remaining wall-clock gap is decode-loop efficiency, not the cache.** The
+  loop currently does *two* target forwards per step (verify the tree, then commit
+  the accepted path) and recomputes the small drafter each step, so it is still
+  slower than the (very fast, KV-cached) 7B vanilla baseline at this acceptance.
+
+The clear path to a wall-clock speedup, in priority order: (1) a one-forward
+re-rooted loop so `target_calls/token → 1/acceptance`; (2) a KV cache for the
+drafter too (remove its per-step recompute); (3) format-matched + longer training
+to push acceptance past ~2. Each is independent and the metrics above isolate
+exactly how much each is worth.
 
 ## Tests
 
