@@ -1,14 +1,23 @@
 # parallel_eagle
 
+[![CI](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml/badge.svg)](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml)
+
 A from-scratch **speculative decoder** whose draft model proposes many future
 tokens in a **single forward pass** and verifies a **branching tree** of candidates
 against the target in one pass — accelerating autoregressive generation while
 producing output that is provably identical to plain decoding.
 
-Built to train and run on a single 8 GB consumer GPU. It implements the whole
-pipeline in PyTorch: a frozen-target feature extractor, a feature-conditioned
-parallel drafter, a memory-scalable training recipe, lossless verification, and a
-benchmark harness that measures acceptance length, call efficiency, and wall-clock.
+Built to train and run on a single 8 GB consumer GPU, against targets up to a
+**4-bit-quantized 7B** model. It implements the whole pipeline in PyTorch: a
+frozen-target feature extractor, a feature-conditioned parallel drafter, a
+memory-scalable training recipe, **KV-cache decoding** (one target forward per
+step) with **lossless greedy and sampling** verification, and a benchmark harness
+that measures acceptance length, call efficiency, and wall-clock.
+
+> **Status:** the algorithm, training recipe, int4 + KV-cache serving, and lossless
+> verification are complete and tested. See *Results* for measured acceptance and
+> the honest wall-clock picture, and *Engineering highlights* for the debugging
+> story behind the drafter.
 
 ## The idea in one paragraph
 
@@ -177,11 +186,43 @@ Findings on the 7B-int4 target (greedy, lossless):
   the accepted path) and recomputes the small drafter each step, so it is still
   slower than the (very fast, KV-cached) 7B vanilla baseline at this acceptance.
 
-The clear path to a wall-clock speedup, in priority order: (1) a one-forward
-re-rooted loop so `target_calls/token → 1/acceptance`; (2) a KV cache for the
-drafter too (remove its per-step recompute); (3) format-matched + longer training
-to push acceptance past ~2. Each is independent and the metrics above isolate
-exactly how much each is worth.
+**Decode loop.** Serving uses a **one-target-forward-per-step** KV-cache loop
+(`generate_speculative_cached`): the candidate tree is verified over the cached
+prefix, the accepted path's KV is kept by index-selecting the cache (rejected
+branches dropped, no recompute), and the loop re-roots on the most recent bonus so
+the next step's depth-0 draft is the easy next token. This drives
+`target_calls/token → ~1/acceptance` — so the win now scales directly with the
+drafter's acceptance, which is the remaining lever (more/format-matched training,
+or a deeper drafter). `temperature > 0` uses the same cache with a lossless
+rejection-sampling rule (`generate_speculative_sampling`).
+
+## Engineering highlights
+
+The interesting part of this project was debugging *why* a feature-conditioned
+drafter wouldn't learn on a real 7B target — a sequence of concrete, measurable
+fixes:
+
+- **Massive activations.** Late-layer hidden states have a few outlier dimensions
+  with magnitude ~200× the rest. Fed raw into the projection, they made the drafter
+  collapse to a unigram predictor (0% next-token match). Fix: **RMS-normalize each
+  fused layer block** before projection.
+- **LM-head input scale.** The drafter shares the target's frozen LM head, which
+  expects input in the target's *final-norm* scale. Giving the drafter its own
+  fresh norm left it mis-scaled. Fix: **share the target's final norm**. Together
+  with the above, the loss broke its plateau (5.4 → ~4.0) and the drafter started
+  predicting.
+- **Train/inference distribution mismatch.** Trained on raw instruction text but
+  served with a chat template, the drafter was out-of-distribution at generation
+  time (acceptance ~1.1). Fix: **format training data with the chat template**;
+  in-distribution tree acceptance rose to ~1.4.
+- **Two forwards per step.** The first cached loop committed the accepted path with
+  a second target forward. Fix: the **one-forward re-rooted loop** above
+  (cache index-select + pending bonus), so `target_calls/token → ~1/acceptance`.
+- **4-bit "massive activation" interplay, memory, masks.** Along the way: int4
+  loading via a pre-quantized checkpoint, an offline head/feature dump so training
+  never holds the target, exact-gradient sequence partitioning to fit long-context
+  training in 8 GB, and amortized + tree attention masks verified against naive
+  rebuilds.
 
 ## Tests
 
