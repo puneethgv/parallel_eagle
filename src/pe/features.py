@@ -118,7 +118,13 @@ class FeatureDataset:
 
     def __init__(self, cache_dir: str | Path):
         self.dir = Path(cache_dir)
-        self.manifest = json.loads((self.dir / "manifest.json").read_text())
+        manifest = self.dir / "manifest.json"
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"No feature cache at {self.dir} (missing manifest.json). "
+                "Run `python -m pe.features` first."
+            )
+        self.manifest = json.loads(manifest.read_text())
         self.feature_dim = self.manifest["feature_dim"]
         self.feature_layers = tuple(self.manifest.get("feature_layers", ()))
         self.heads_dump = self.dir / "heads.pt"

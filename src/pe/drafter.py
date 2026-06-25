@@ -17,6 +17,8 @@ row.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -286,6 +288,10 @@ class ParallelDrafter(nn.Module):
 
 def load_drafter(path, target) -> ParallelDrafter:
     """Rebuild a drafter from a checkpoint, re-sharing ``target``'s embed/LM head."""
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"No drafter checkpoint at {path}. Train one first with `python -m pe.train`."
+        )
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     dcfg = DrafterConfig(num_layers=ckpt["num_layers"], max_depth=ckpt["max_depth"])
     model = ParallelDrafter.from_target(target, dcfg)
