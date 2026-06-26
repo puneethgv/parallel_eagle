@@ -15,9 +15,9 @@ from statistics import mean
 import torch
 
 from pe.config import TargetConfig
-from pe.decode.baselines import vanilla_generate
+from pe.decode.baselines import vanilla_generate, vanilla_generate_cached
 from pe.drafter import load_drafter
-from pe.serve import generate_speculative
+from pe.serve import generate_speculative, generate_speculative_cached
 from pe.target import TargetModel
 
 PROMPTS = [
@@ -58,14 +58,20 @@ def run(args) -> Path:
     eos = target.tokenizer.eos_token_id
     prompts = build_prompts(target)
 
+    # The cached one-forward loop is what ships; benchmark it (and its matching
+    # KV-cached vanilla denominator) by default. --recompute selects the prefix-
+    # recompute loop instead (no KV cache) for the lossless-equivalence reference.
+    vgen = vanilla_generate if args.recompute else vanilla_generate_cached
+    sgen = generate_speculative if args.recompute else generate_speculative_cached
+
     # warm up CUDA kernels so timings are representative
-    _ = vanilla_generate(target, prompts[0], 8, eos)
-    _ = generate_speculative(target, drafter, prompts[0], k=args.k_values[0], mode="tree",
-                             max_new_tokens=8, tree_top_k=args.tree_top_k,
-                             tree_max_nodes=args.tree_max_nodes, eos_token_id=eos)
+    _ = vgen(target, prompts[0], 8, eos)
+    _ = sgen(target, drafter, prompts[0], k=args.k_values[0], mode="tree",
+             max_new_tokens=8, tree_top_k=args.tree_top_k,
+             tree_max_nodes=args.tree_max_nodes, eos_token_id=eos)
 
     # vanilla is independent of K; compute once per prompt
-    refs = [vanilla_generate(target, p, args.max_new_tokens, eos) for p in prompts]
+    refs = [vgen(target, p, args.max_new_tokens, eos) for p in prompts]
     van_tps = mean(r.tokens_per_second for r in refs)
 
     rows = [
@@ -85,7 +91,7 @@ def run(args) -> Path:
         for name, mode in SPECULATIVE.items():
             al, tps, tcpt, dcpt, match = [], [], [], [], []
             for p, ref in zip(prompts, refs, strict=True):
-                res = generate_speculative(
+                res = sgen(
                     target, drafter, p, k=k, mode=mode, max_new_tokens=args.max_new_tokens,
                     tree_top_k=args.tree_top_k, tree_max_nodes=args.tree_max_nodes,
                     eos_token_id=eos,
@@ -133,6 +139,8 @@ def _parse():
     p.add_argument("--tree-top-k", type=int, default=3)
     p.add_argument("--tree-max-nodes", type=int, default=24)
     p.add_argument("--results-dir", default="results")
+    p.add_argument("--recompute", action="store_true",
+                   help="use the prefix-recompute loop instead of the shipped KV-cache loop")
     return p.parse_args()
 
 
