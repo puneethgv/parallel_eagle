@@ -35,9 +35,16 @@ def build_prompt(target: TargetModel, text: str) -> list[int]:
 
 
 def streamer(target: TargetModel):
+    # Decode incrementally against the full running sequence so inter-token spaces
+    # (which BPE/sentencepiece encode as a prefix on the *next* token) survive — a
+    # per-chunk decode drops them and runs the words together.
+    state: list[int] = []
+
     def cb(toks: list[int]):
-        txt = target.tokenizer.decode(toks, skip_special_tokens=True)
-        print(f"{BOLD}{txt}{RESET}" if len(toks) > 1 else txt, end="", flush=True)
+        prev = target.tokenizer.decode(state, skip_special_tokens=True)
+        state.extend(toks)
+        delta = target.tokenizer.decode(state, skip_special_tokens=True)[len(prev):]
+        print(f"{BOLD}{delta}{RESET}" if len(toks) > 1 else delta, end="", flush=True)
 
     return cb
 

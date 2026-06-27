@@ -16,8 +16,9 @@ env/
 
 # Large / regenerable artifacts
 data/
-features_cache/
-checkpoints/
+features_cache*/
+distill_cache*/
+checkpoints*/
 models/
 runs/
 wandb/
@@ -29,6 +30,8 @@ wandb/
 # Benchmark scratch output (curated results live under results/ and are tracked)
 bench_out/
 *.log
+*.cast
+docs/demo_preview.gif
 
 # OS / editor
 .DS_Store

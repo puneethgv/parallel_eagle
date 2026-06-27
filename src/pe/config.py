@@ -74,6 +74,11 @@ class TrainConfig:
     use_8bit_adam: bool = True
     grad_checkpoint: bool = True
     log_every: int = 20
+    # Periodic mid-epoch checkpointing for preemption-resilience. 0 = save only at
+    # epoch boundaries; >0 = also save every N optimizer updates (and on resume,
+    # fast-forward into the in-progress epoch). Essential on preemptible cloud GPUs
+    # where an epoch can exceed the mean time-between-preemptions.
+    save_every: int = 0
 
 
 @dataclass
@@ -86,6 +91,26 @@ class FeatureConfig:
     max_examples: int = 2000
     max_seq_len: int = 2048
     shard_size: int = 256  # examples per shard
+
+
+@dataclass
+class DistillConfig:
+    """Self-distillation feature generation.
+
+    Instead of caching features over human-written responses, run the target's
+    *own* greedy generation on each prompt and cache features over
+    ``[prompt | target response]``. The training label at each response position
+    then equals the target's argmax — exactly what decode-time acceptance
+    measures — so training directly optimizes acceptance length.
+    """
+
+    out_dir: Path = Path("distill_cache")
+    dataset: str = "tatsu-lab/alpaca"
+    split: str = "train"
+    max_examples: int = 2000
+    max_prompt_len: int = 512  # truncate the user prompt to this many tokens
+    max_new_tokens: int = 256  # cap on the target's generated response length
+    shard_size: int = 256
 
 
 @dataclass

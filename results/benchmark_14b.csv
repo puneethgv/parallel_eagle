@@ -1,0 +1,8 @@
+method,k,acceptance_length,tokens_per_second,speedup_vs_vanilla,target_calls_per_token,drafter_calls_per_token,lossless_match_rate
+vanilla,-,1.0,22.46,1.0,1.0,0.0,1.0
+sequential,5,1.299,13.31,0.593,1.026,3.886,0.4
+chain,5,1.3,17.81,0.793,1.028,0.778,0.4
+tree,5,1.447,20.93,0.932,0.877,0.707,0.3
+sequential,7,1.299,11.82,0.526,1.026,5.441,0.4
+chain,7,1.302,17.84,0.794,1.027,0.778,0.4
+tree,7,1.455,20.83,0.928,0.867,0.701,0.5

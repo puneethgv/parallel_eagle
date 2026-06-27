@@ -114,20 +114,31 @@ def extract_features(fcfg: FeatureConfig, tcfg: TargetConfig) -> Path:
 
 
 class FeatureDataset:
-    """Iterates cached ``(input_ids, features)`` examples across shards."""
+    """Iterates cached ``(input_ids, features)`` examples across shards.
 
-    def __init__(self, cache_dir: str | Path):
+    With ``with_prompt_len=True`` each item is a ``(input_ids, features,
+    prompt_len, labels)`` tuple instead; ``prompt_len`` is the number of leading
+    prompt tokens (0 when the shard predates self-distillation), used to mask the
+    prompt region out of the training loss, and ``labels`` is the target's
+    teacher-forced argmax per position (``None`` for human-text caches, which train
+    on the next token). Self-distilled caches set ``self_distilled`` in the
+    manifest and record a per-example ``prompt_len`` + ``labels``.
+    """
+
+    def __init__(self, cache_dir: str | Path, with_prompt_len: bool = False):
         self.dir = Path(cache_dir)
         manifest = self.dir / "manifest.json"
         if not manifest.exists():
             raise FileNotFoundError(
                 f"No feature cache at {self.dir} (missing manifest.json). "
-                "Run `python -m pe.features` first."
+                "Run `python -m pe.features` (or `python -m pe.distill`) first."
             )
         self.manifest = json.loads(manifest.read_text())
         self.feature_dim = self.manifest["feature_dim"]
         self.feature_layers = tuple(self.manifest.get("feature_layers", ()))
+        self.self_distilled = bool(self.manifest.get("self_distilled", False))
         self.heads_dump = self.dir / "heads.pt"
+        self.with_prompt_len = with_prompt_len
 
     def __len__(self) -> int:
         return self.manifest["num_examples"]
@@ -135,7 +146,15 @@ class FeatureDataset:
     def __iter__(self):
         for shard in self.manifest["shards"]:
             for ex in torch.load(self.dir / shard, weights_only=False):
-                yield ex["input_ids"], ex["features"]
+                if self.with_prompt_len:
+                    yield (
+                        ex["input_ids"],
+                        ex["features"],
+                        int(ex.get("prompt_len", 0)),
+                        ex.get("labels"),
+                    )
+                else:
+                    yield ex["input_ids"], ex["features"]
 
 
 def _parse_args() -> tuple[FeatureConfig, TargetConfig]:

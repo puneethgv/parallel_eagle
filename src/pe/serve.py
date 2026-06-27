@@ -328,15 +328,19 @@ def generate_speculative_cached(
             emit = [int(root_logit.argmax())]
 
         steps += 1
+        emitted: list[int] = []
         for tok in emit:
             seq.append(tok)
-            if on_commit is not None:
-                on_commit([tok])
+            emitted.append(tok)
             if eos_token_id is not None and tok == eos_token_id:
                 stop = True
                 break
             if len(seq) - base >= max_new_tokens:
                 break
+        # Emit the whole step's burst at once so a streaming consumer can show
+        # multi-token commits as a single chunk (display only; output unchanged).
+        if on_commit is not None and emitted:
+            on_commit(emitted)
 
     if dev.type == "cuda":
         torch.cuda.synchronize()
