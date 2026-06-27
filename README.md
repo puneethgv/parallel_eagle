@@ -1,5 +1,5 @@
-# parallel Eagle
-
+# Parallel Eagle
+___
 [![CI](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml/badge.svg)](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml)
 
 ![naive vs. parallel-tree speculative decoding on an fp16 14B target — identical output, but the tree commits accepted tokens in multi-token bursts and finishes first](docs/demo.gif)
