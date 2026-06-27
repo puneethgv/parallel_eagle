@@ -74,6 +74,11 @@ class TrainConfig:
     use_8bit_adam: bool = True
     grad_checkpoint: bool = True
     log_every: int = 20
+    # Periodic mid-epoch checkpointing for preemption-resilience. 0 = save only at
+    # epoch boundaries; >0 = also save every N optimizer updates (and on resume,
+    # fast-forward into the in-progress epoch). Essential on preemptible cloud GPUs
+    # where an epoch can exceed the mean time-between-preemptions.
+    save_every: int = 0
 
 
 @dataclass
