@@ -149,86 +149,31 @@ python -m pe.train    --target $T --dtype bfloat16 --num-layers 4 --num-segments
 python bench/demo.py  --target $T --stream            # side-by-side vs naive, KV-cached
 ```
 
+## Models used
+
+All targets are public; any causal LM that exposes hidden states + an LM head works via
+`--target`. The **drafter** is trained from scratch — a small 2–4-layer transformer that
+reuses the target's *frozen* token embedding and LM head, so only its few layers learn.
+
+| Role | Target model | Setting |
+|---|---|---|
+| Toy target (pipeline validation) | `Qwen2.5-0.5B-Instruct` | CPU, fp32 |
+| Quantized 7B target | `unsloth/mistral-7b-instruct-v0.3-bnb-4bit` (4-bit) | single 8 GB GPU |
+| **Headline target** | **`Qwen2.5-14B-Instruct`** | **fp16, A100-80 GB** |
+
 ## Results
 
-Target `Qwen2.5-0.5B-Instruct`, a 3-layer drafter (`K_train=6`) trained on a single
-8 GB RTX 3070, greedy decoding, fp32, 10 held-out prompts, `K=5`
-(reproduce with `bench/run_bench.py`):
-
-| Strategy | Acceptance length | Target calls / token | Drafter calls / token | Lossless |
-|---|---|---|---|---|
-| vanilla autoregressive | 1.000 | 1.000 | 0.00 | ✓ |
-| sequential chain | 1.023 | 1.006 | 5.84 | ✓ |
-| parallel chain | 1.029 | 1.001 | 0.97 | ✓ |
-| **parallel dynamic tree** | **1.151** | **0.901** | 0.87 | ✓ |
-
-![benchmark](results/benchmark.png)
-
-Takeaways:
-- **Dynamic tree drafting lifts acceptance +12% over the chain** (1.151 vs 1.029) at
-  effectively the same drafter cost, and brings **target forward passes per token
-  below 1.0** (0.901) — a net reduction in target compute, losslessly.
-- **Parallel drafting is ~6× more call-efficient than sequential** (0.87 vs 5.84
-  drafter calls per token) — the cost that one-pass drafting removes.
-- Losslessness is exact: every strategy reproduces vanilla greedy token-for-token.
-
-**Memory scaling.** Training one 512-token example through the drafter, varying the
-number of sequence-partitioning segments `S` (`bench/mem_scaling.py`):
-
-| Segments `S` | Peak training memory |
-|---|---|
-| 1 | out of memory |
-| 2 | 5.1 GB |
-| 3 | 3.5 GB |
-| 6 | 2.0 GB |
-
-The loss is identical across `S` (the partitioned gradient equals the
-full-sequence gradient exactly), yet the context that **OOMs at `S=1` trains
-comfortably at `S=6`** — which is how long-context training fits an 8 GB card.
-
-### Scaling up: int4 7B target + KV-cache decoding
-
-The same code runs against a **pre-quantized 4-bit 7B target** (`--target
-unsloth/mistral-7b-instruct-v0.3-bnb-4bit`, ~4 GB, fits 8 GB) with a **KV-cache**
-generation loop (`generate_speculative_cached`): the cache holds the confirmed
-prefix, so each step does incremental target forwards instead of recomputing the
-prefix, and a fair cached vanilla baseline (`vanilla_generate_cached`) is the
-comparison. Training stays light via the offline head/feature dump and sequence
-partitioning (a 4096-hidden drafter trains in ~5 GB with 8-bit Adam).
-
-**Decode loop.** Serving uses a **one-target-forward-per-step** KV-cache loop
-(`generate_speculative_cached`): the candidate tree is verified over the cached
-prefix, the accepted path's KV is kept by index-selecting the cache (rejected
-branches dropped, no recompute), and the loop re-roots on the most recent bonus.
-`temperature > 0` uses the same cache with a lossless rejection-sampling rule
-(`generate_speculative_sampling`). Vanilla uses the same cache
-(`vanilla_generate_cached`) so the comparison is fair.
-
-What it takes on the 7B-int4 target (greedy, lossless, in-distribution prompts):
-
-| | tokens/sec | acceptance | target calls/token |
-|---|---|---|---|
-| vanilla (KV-cached) | **25** | 1.00 | 1.00 |
-| parallel dynamic tree | ~7 | ~1.4 (drafter) | > 1 |
-
-The trained drafter genuinely learns (in-distribution tree acceptance ≈ **1.4**,
-chain ≈ 1.14), and the loop is correct (lossless) — **but it is not yet faster than
-vanilla**, and the honest reason is precise: a KV-cached 7B-int4 forward is
-*memory-bandwidth bound*, so vanilla decodes ~25 tok/s, and speculation only wins
-once **target-calls-per-token drops below 1**. That needs the drafter's *depth-0*
-(next-token) prediction to be reliable enough — roughly **acceptance ≳ 2** — so the
-one-forward loop rarely falls back to a second forward. This drafter, trained on a
-few-thousand-example budget on an 8 GB laptop, reaches ~1.4, which keeps
-calls/token above 1. A deeper/longer-trained drafter is the single remaining lever —
-and the 14B run below confirms it: scaling the target and the training budget pushes
-acceptance up and across break-even.
-
-In short: every component a production speculative-decoding stack needs is here and
-verified — feature-conditioned parallel drafting, dynamic-tree + tree-attention
-verification, one-forward KV-cache serving with cache surgery, lossless greedy and
-sampling, int4 quantization, and a memory-scalable training recipe — and the metrics
-isolate exactly the one thing (drafter acceptance) that a larger training budget
-would close.
+The full pipeline was first validated on smaller targets — the `Qwen2.5-0.5B` toy model
+(CPU, fp32) and the **4-bit Mistral-7B** target on a single 8 GB GPU. Both confirmed the
+core behaviour: decoding is **exactly lossless** (every strategy reproduces vanilla
+greedy token-for-token), **dynamic-tree drafting beats a single chain**, and **parallel
+one-pass drafting is ~6× more call-efficient than sequential** drafting. On the int4-7B
+the drafter reached acceptance ~1.4 but was not yet faster than vanilla — a KV-cached
+7B-int4 forward is so memory-bandwidth-bound (~25 tok/s) that speculation only wins once
+acceptance is high enough to drive target-forwards-per-token below 1.0. That isolated
+**drafter acceptance as the one lever** — which the 14B run below confirms. (The
+memory-scalable training recipe, exact-gradient sequence partitioning, is what lets
+long-context drafter training fit an 8 GB card; see `bench/mem_scaling.py`.)
 
 ### Crossing break-even: fp16 14B target on an A100
 
@@ -251,7 +196,7 @@ Two things are worth calling out:
 
 - **It crosses break-even.** At 15 epochs the parallel-tree loop is genuinely faster
   than vanilla — `target_calls/token` falls to **0.82** (below 1.0), the condition the
-  7B section predicted was needed for a win.
+  int4-7B run flagged as needed for a win.
 - **Acceptance is monotonic in training and not plateaued**: 1.345 (local 7B proof) →
   1.447 (6 epochs) → 1.677 (15 epochs) on the *same* data, purely from more epochs.
 
@@ -310,31 +255,21 @@ and every remaining gain is a matter of training compute.
 
 ## Engineering highlights
 
-The interesting part of this project was debugging *why* a feature-conditioned
-drafter wouldn't learn on a real 7B target — a sequence of concrete, measurable
-fixes:
+Getting a feature-conditioned drafter to actually learn on a real target took a few
+concrete, measurable fixes:
 
-- **Massive activations.** Late-layer hidden states have a few outlier dimensions
-  with magnitude ~200× the rest. Fed raw into the projection, they made the drafter
-  collapse to a unigram predictor (0% next-token match). Fix: **RMS-normalize each
-  fused layer block** before projection.
-- **LM-head input scale.** The drafter shares the target's frozen LM head, which
-  expects input in the target's *final-norm* scale. Giving the drafter its own
-  fresh norm left it mis-scaled. Fix: **share the target's final norm**. Together
-  with the above, the loss broke its plateau (5.4 → ~4.0) and the drafter started
-  predicting.
-- **Train/inference distribution mismatch.** Trained on raw instruction text but
-  served with a chat template, the drafter was out-of-distribution at generation
-  time (acceptance ~1.1). Fix: **format training data with the chat template**;
-  in-distribution tree acceptance rose to ~1.4.
-- **Two forwards per step.** The first cached loop committed the accepted path with
-  a second target forward. Fix: the **one-forward re-rooted loop** above
-  (cache index-select + pending bonus), so `target_calls/token → ~1/acceptance`.
-- **4-bit "massive activation" interplay, memory, masks.** Along the way: int4
-  loading via a pre-quantized checkpoint, an offline head/feature dump so training
-  never holds the target, exact-gradient sequence partitioning to fit long-context
-  training in 8 GB, and amortized + tree attention masks verified against naive
-  rebuilds.
+- **Massive activations** in late-layer hidden states (a few outlier dims ~200× the
+  rest) collapsed the drafter to a unigram predictor until each fused layer block was
+  **RMS-normalized** before projection.
+- **Sharing the target's frozen final-norm + LM head** (so the drafter outputs in the
+  head's scale) broke the loss plateau (5.4 → ~4.0).
+- **Chat-template formatting** of training data fixed a train/inference mismatch
+  (acceptance ~1.1 → ~1.4), and a **one-forward re-rooted KV-cache loop** (cache
+  index-select + pending bonus) cut serving to ~`1/acceptance` target forwards/token.
+
+Plus the supporting machinery: int4 loading, an offline head/feature dump so training
+never holds the target, exact-gradient sequence partitioning for 8 GB long-context
+training, and tree-attention masks verified against naive rebuilds.
 
 ## Tests
 
